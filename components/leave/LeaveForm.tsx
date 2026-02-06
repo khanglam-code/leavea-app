@@ -34,34 +34,45 @@ export function LeaveForm({ type, onBack }: LeaveFormProps) {
   const handleSubmit = async () => {
     setLoading(true);
     try {
-      // Mock User Data (Replace with Auth later)
       const userData = {
         userId: "user_123",
         userEmail: "khang@nexus.com",
         userName: "Khang",
       };
 
+      let payload: any = { ...userData, reason };
+
       if (type === "leave") {
-        await createRequest({
-          ...userData,
+        payload = {
+          ...payload,
           category: "leave",
           type: leaveType,
           startDate: new Date(startDate).getTime(),
           endDate: new Date(endDate || startDate).getTime(),
           session: session as any,
-          reason,
-        });
+        };
       } else {
-        await createRequest({
-          ...userData,
+        payload = {
+          ...payload,
           category: "late",
           type: lateType === "late" ? "Late Arrival" : "Early Departure",
           targetDate: new Date(lateDate).getTime(),
           targetTime: lateTime,
-          reason,
-        });
+        };
       }
+
+      await createRequest(payload);
       setSuccess(true);
+
+      // BẮN DATA SANG GOOGLE SHEET (WEBHOOK)
+      const GAS_WEBHOOK_URL = ""; // TODO: Sếp dán link Web App của Google Script vào đây
+      if (GAS_WEBHOOK_URL) {
+        fetch(GAS_WEBHOOK_URL, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        }).catch(e => console.error("Sheet Sync Error:", e));
+      }
+
       setTimeout(onBack, 1500); // Auto back after success
     } catch (error) {
       alert("Error: " + error);
