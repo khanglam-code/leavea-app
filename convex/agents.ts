@@ -1,0 +1,269 @@
+import { v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+
+// CREATE
+export const create = mutation({
+  args: {
+    name: v.string(),
+    role: v.union(
+      v.literal("master"),
+      v.literal("pm"),
+      v.literal("backend"),
+      v.literal("frontend"),
+      v.literal("fullstack"),
+      v.literal("qa"),
+      v.literal("research"),
+      v.literal("devops")
+    ),
+    avatar: v.string(),
+    isMaster: v.optional(v.boolean()),
+    teamId: v.optional(v.id("teams")),
+    openclawConfig: v.optional(v.object({
+      gatewayUrl: v.string(),
+      token: v.string(),
+      sessionKey: v.optional(v.string()),
+    })),
+  },
+  handler: async (ctx, args) => {
+    const agentId = await ctx.db.insert("agents", {
+      name: args.name,
+      role: args.role,
+      status: "offline",
+      avatar: args.avatar,
+      lastSeen: Date.now(),
+      isMaster: args.isMaster,
+      teamId: args.teamId,
+      openclawConfig: args.openclawConfig,
+    });
+    return agentId;
+  },
+});
+
+// READ - Get all agents (never throw — dashboard/layout depend on this)
+export const list = query({
+  handler: async (ctx) => {
+    try {
+      return await ctx.db.query("agents").collect();
+    } catch {
+      return [];
+    }
+  },
+});
+
+// READ - Get agent by ID
+export const get = query({
+  args: { id: v.id("agents") },
+  handler: async (ctx, args) => {
+    return await ctx.db.get(args.id);
+  },
+});
+
+/** AGT-170: List agents with currentTask linearIdentifier for Agent Strip */
+export const listForStrip = query({
+  handler: async (ctx) => {
+    const agents = await ctx.db.query("agents").collect();
+    return Promise.all(
+      agents.map(async (a) => {
+        let currentTaskIdentifier: string | null = null;
+        if (a.currentTask) {
+          const task = await ctx.db.get(a.currentTask);
+          currentTaskIdentifier = task?.linearIdentifier ?? null;
+        }
+        return {
+          _id: a._id,
+          name: a.name,
+          role: a.role,
+          status: a.status,
+          avatar: a.avatar,
+          currentTaskIdentifier,
+        };
+      })
+    );
+  },
+});
+
+// READ - Get agents by status
+export const getByStatus = query({
+  args: {
+    status: v.union(
+      v.literal("online"),
+      v.literal("idle"),
+      v.literal("offline"),
+      v.literal("busy")
+    ),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("agents")
+      .withIndex("by_status", (q) => q.eq("status", args.status))
+      .collect();
+  },
+});
+
+// UPDATE - Update agent status
+export const updateStatus = mutation({
+  args: {
+    id: v.id("agents"),
+    status: v.union(
+      v.literal("online"),
+      v.literal("idle"),
+      v.literal("offline"),
+      v.literal("busy")
+    ),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, {
+      status: args.status,
+      lastSeen: Date.now(),
+    });
+  },
+});
+
+// UPDATE - Assign task to agent
+export const assignTask = mutation({
+  args: {
+    id: v.id("agents"),
+    taskId: v.optional(v.id("tasks")),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, {
+      currentTask: args.taskId,
+      lastSeen: Date.now(),
+    });
+  },
+});
+
+// UPDATE - Update agent details
+export const update = mutation({
+  args: {
+    id: v.id("agents"),
+    name: v.optional(v.string()),
+    avatar: v.optional(v.string()),
+    role: v.optional(
+      v.union(
+        v.literal("master"),
+        v.literal("pm"),
+        v.literal("backend"),
+        v.literal("frontend"),
+        v.literal("fullstack"),
+        v.literal("qa"),
+        v.literal("research"),
+        v.literal("devops")
+      )
+    ),
+    isMaster: v.optional(v.boolean()),
+    teamId: v.optional(v.id("teams")),
+  },
+  handler: async (ctx, args) => {
+    const { id, ...updates } = args;
+    await ctx.db.patch(id, {
+      ...updates,
+      lastSeen: Date.now(),
+    });
+  },
+});
+
+// UPDATE - Update OpenClaw configuration
+export const updateOpenClawConfig = mutation({
+  args: {
+    id: v.id("agents"),
+    openclawConfig: v.optional(v.object({
+      gatewayUrl: v.string(),
+      token: v.string(),
+      sessionKey: v.optional(v.string()),
+    })),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, {
+      openclawConfig: args.openclawConfig,
+      lastSeen: Date.now(),
+    });
+  },
+});
+
+// QUERY - Get master agent
+export const getMaster = query({
+  handler: async (ctx) => {
+    const masterAgent = await ctx.db
+      .query("agents")
+      .filter((q) => q.eq(q.field("isMaster"), true))
+      .first();
+    
+    if (masterAgent) return masterAgent;
+    
+    // Fallback: look for role "master"
+    return await ctx.db
+      .query("agents")
+      .withIndex("by_role", (q) => q.eq("role", "master"))
+      .first();
+  },
+});
+
+// QUERY - Get agents by team
+export const getByTeam = query({
+  args: { teamId: v.id("teams") },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("agents")
+      .withIndex("by_team", (q) => q.eq("teamId", args.teamId))
+      .collect();
+  },
+});
+
+// UPDATE - Heartbeat
+export const heartbeat = mutation({
+  args: {
+    id: v.id("agents"),
+    status: v.union(
+      v.literal("online"),
+      v.literal("idle"),
+      v.literal("offline"),
+      v.literal("busy")
+    ),
+    metadata: v.optional(v.any()),
+  },
+  handler: async (ctx, args) => {
+    const { id, status, metadata } = args;
+
+    // Update agent
+    await ctx.db.patch(id, {
+      status,
+      lastSeen: Date.now(),
+    });
+
+    // Record heartbeat
+    await ctx.db.insert("heartbeats", {
+      agent: id,
+      status,
+      timestamp: Date.now(),
+      metadata,
+    });
+  },
+});
+
+/** Update agent lastSeen (AGT-133: when sync runs, touch sync-runner agent) */
+export const touchLastSeen = mutation({
+  args: { agentId: v.id("agents") },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.agentId, { lastSeen: Date.now() });
+  },
+});
+
+/** AGT-171: Update agent soul data */
+export const updateSoul = mutation({
+  args: {
+    id: v.id("agents"),
+    soul: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, { soul: args.soul });
+  },
+});
+
+// DELETE
+export const remove = mutation({
+  args: { id: v.id("agents") },
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.id);
+  },
+});

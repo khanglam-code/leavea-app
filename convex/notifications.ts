@@ -1,0 +1,299 @@
+import { v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+
+// CREATE (AGT-115: enhanced with from field and new types)
+export const create = mutation({
+  args: {
+    to: v.id("agents"),
+    from: v.optional(v.id("agents")), // AGT-115: Who triggered it
+    type: v.union(
+      v.literal("mention"),
+      v.literal("assignment"),
+      v.literal("status_change"),
+      v.literal("review_request"),
+      v.literal("comment"),  // AGT-112
+      v.literal("dm")        // AGT-118
+    ),
+    title: v.string(),
+    message: v.string(),
+    relatedTask: v.optional(v.id("tasks")),
+    commentId: v.optional(v.id("taskComments")), // AGT-112
+  },
+  handler: async (ctx, args) => {
+    const notificationId = await ctx.db.insert("notifications", {
+      to: args.to,
+      from: args.from,
+      type: args.type,
+      title: args.title,
+      message: args.message,
+      read: false,
+      relatedTask: args.relatedTask,
+      commentId: args.commentId,
+      createdAt: Date.now(),
+    });
+    return notificationId;
+  },
+});
+
+// READ - Get all notifications for an agent
+export const getByAgent = query({
+  args: { agent: v.id("agents") },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("notifications")
+      .withIndex("by_recipient", (q) => q.eq("to", args.agent))
+      .order("desc")
+      .collect();
+  },
+});
+
+// READ - Get unread notifications
+export const getUnread = query({
+  args: { agent: v.id("agents") },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("notifications")
+      .withIndex("by_read_status", (q) => q.eq("to", args.agent).eq("read", false))
+      .order("desc")
+      .collect();
+  },
+});
+
+// READ - Get unread count
+export const getUnreadCount = query({
+  args: { agent: v.id("agents") },
+  handler: async (ctx, args) => {
+    const unread = await ctx.db
+      .query("notifications")
+      .withIndex("by_read_status", (q) => q.eq("to", args.agent).eq("read", false))
+      .collect();
+    return unread.length;
+  },
+});
+
+// READ - Get notification by ID
+export const get = query({
+  args: { id: v.id("notifications") },
+  handler: async (ctx, args) => {
+    return await ctx.db.get(args.id);
+  },
+});
+
+// UPDATE - Mark as read
+export const markAsRead = mutation({
+  args: { id: v.id("notifications") },
+  handler: async (ctx, args) => {
+    await ctx.db.patch(args.id, { read: true });
+  },
+});
+
+// UPDATE - Mark all as read for an agent
+export const markAllAsRead = mutation({
+  args: { agent: v.id("agents") },
+  handler: async (ctx, args) => {
+    const unread = await ctx.db
+      .query("notifications")
+      .withIndex("by_read_status", (q) => q.eq("to", args.agent).eq("read", false))
+      .collect();
+
+    for (const notification of unread) {
+      await ctx.db.patch(notification._id, { read: true });
+    }
+
+    return unread.length;
+  },
+});
+
+// DELETE
+export const remove = mutation({
+  args: { id: v.id("notifications") },
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.id);
+  },
+});
+
+// DELETE - Clear old read notifications
+export const clearRead = mutation({
+  args: {
+    agent: v.id("agents"),
+    olderThan: v.optional(v.number()), // timestamp, default to 7 days ago
+  },
+  handler: async (ctx, args) => {
+    const cutoff = args.olderThan ?? Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    const readNotifications = await ctx.db
+      .query("notifications")
+      .withIndex("by_recipient", (q) => q.eq("to", args.agent))
+      .collect();
+
+    const toDelete = readNotifications.filter(
+      (n) => n.read && n.createdAt < cutoff
+    );
+
+    for (const notification of toDelete) {
+      await ctx.db.delete(notification._id);
+    }
+
+    return toDelete.length;
+  },
+});
+
+/**
+ * AGT-116: Dashboard — all notifications grouped by agent (Son sees all). Total unread + byAgent with notifications.
+ */
+export const listAllForDashboard = query({
+  handler: async (ctx) => {
+    const all = await ctx.db.query("notifications").collect();
+    const agents = await ctx.db.query("agents").collect();
+    const agentMap = new Map(agents.map((a) => [a._id, a]));
+
+    const byAgentId = new Map<
+      string,
+      { agentId: string; agentName: string; agentAvatar: string; unreadCount: number; notifications: unknown[] }
+    >();
+
+    for (const n of all) {
+      const key = n.to;
+      if (!byAgentId.has(key)) {
+        const agent = agentMap.get(n.to);
+        byAgentId.set(key, {
+          agentId: key,
+          agentName: agent?.name ?? "Unknown",
+          agentAvatar: agent?.avatar ?? "?",
+          unreadCount: 0,
+          notifications: [],
+        });
+      }
+      const group = byAgentId.get(key)!;
+      if (!n.read) group.unreadCount += 1;
+
+      const taskSummary =
+        n.relatedTask != null
+          ? await ctx.db.get(n.relatedTask).then((t) =>
+              t
+                ? {
+                    id: t._id,
+                    title: t.title,
+                    linearIdentifier: t.linearIdentifier,
+                    linearUrl: t.linearUrl,
+                    status: t.status,
+                    priority: t.priority,
+                  }
+                : null
+            )
+          : null;
+
+      group.notifications.push({
+        _id: n._id,
+        type: n.type,
+        title: n.title,
+        message: n.message,
+        read: n.read,
+        relatedTask: n.relatedTask,
+        createdAt: n.createdAt,
+        taskSummary,
+      });
+    }
+
+    const byAgent = Array.from(byAgentId.values())
+      .map((g) => ({
+        ...g,
+        notifications: (g.notifications as { createdAt: number; _id: string; type: string; title: string; read: boolean; taskSummary?: unknown }[])
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .slice(0, 20),
+      }))
+      .filter((g) => g.notifications.length > 0)
+      .sort((a, b) => (b.notifications[0]?.createdAt ?? 0) - (a.notifications[0]?.createdAt ?? 0));
+
+    const totalUnread = Array.from(byAgentId.values()).reduce((s, g) => s + g.unreadCount, 0);
+
+    return { totalUnread, byAgent };
+  },
+});
+
+/**
+ * AGT-115: Get unread notifications by agent name (for boot protocol)
+ */
+export const getUnreadByAgentName = query({
+  args: { agentName: v.string() },
+  handler: async (ctx, args) => {
+    const agents = await ctx.db.query("agents").collect();
+    const agent = agents.find(
+      (a) => a.name.toLowerCase() === args.agentName.toLowerCase()
+    );
+
+    if (!agent) {
+      return [];
+    }
+
+    const unread = await ctx.db
+      .query("notifications")
+      .withIndex("by_read_status", (q) => q.eq("to", agent._id).eq("read", false))
+      .order("desc")
+      .collect();
+
+    // Enrich with sender info
+    const enriched = await Promise.all(
+      unread.map(async (n) => {
+        const fromAgent = n.from ? await ctx.db.get(n.from) : null;
+        return {
+          ...n,
+          fromAgentName: fromAgent?.name || null,
+        };
+      })
+    );
+
+    return enriched;
+  },
+});
+
+/**
+ * AGT-143: Clear ALL notifications for an agent (mark as read + delete old).
+ * This is useful when user wants to dismiss all notifications.
+ */
+export const clearAll = mutation({
+  args: { agent: v.id("agents") },
+  handler: async (ctx, args) => {
+    const allNotifications = await ctx.db
+      .query("notifications")
+      .withIndex("by_recipient", (q) => q.eq("to", args.agent))
+      .collect();
+
+    // Delete all notifications for this agent
+    for (const notification of allNotifications) {
+      await ctx.db.delete(notification._id);
+    }
+
+    return { deleted: allNotifications.length };
+  },
+});
+
+/**
+ * AGT-143: TTL cleanup — delete notifications older than N hours.
+ * Run: npx convex run notifications:cleanup '{"hoursOld": 24}'
+ */
+export const cleanup = mutation({
+  args: {
+    hoursOld: v.optional(v.number()), // default 24 hours
+  },
+  handler: async (ctx, args) => {
+    const hours = args.hoursOld ?? 24;
+    const cutoff = Date.now() - hours * 60 * 60 * 1000;
+
+    const allNotifications = await ctx.db.query("notifications").collect();
+
+    const oldNotifications = allNotifications.filter(
+      (n) => n.createdAt < cutoff
+    );
+
+    for (const notification of oldNotifications) {
+      await ctx.db.delete(notification._id);
+    }
+
+    return {
+      deleted: oldNotifications.length,
+      remaining: allNotifications.length - oldNotifications.length,
+      cutoffHours: hours,
+    };
+  },
+});

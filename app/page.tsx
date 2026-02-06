@@ -1,0 +1,104 @@
+"use client";
+
+import { useState, useMemo } from "react";
+import { useQuery } from "convex/react";
+import { api } from "@/convex/_generated/api";
+import { Id } from "@/convex/_generated/dataModel";
+import { NotificationTopBarWrapper } from "@/components/notification-topbar-wrapper";
+import { MissionQueue } from "@/components/dashboard-v2/mission-queue";
+import { SettingsModal } from "@/components/dashboard-v2/settings-modal";
+import { AgentBottomBar } from "@/components/dashboard-v2/agent-bottom-bar";
+import { AgentProfileModal } from "@/components/dashboard-v2/agent-profile-modal";
+import { ActivityDrawer } from "@/components/dashboard-v2/activity-drawer";
+import { TaskDetailModal } from "@/components/dashboard-v2/task-detail-modal";
+import type { KanbanTask } from "@/components/dashboard-v2/task-card";
+import type { DateFilterMode } from "@/components/dashboard-v2/date-filter";
+
+/** AGT-181: 2-panel layout — [Sidebar 180px] | [Kanban flex-1]. Agent Profile → Modal, Activity → Drawer */
+export default function Home() {
+  const [date, setDate] = useState(new Date());
+  const [dateMode, setDateMode] = useState<DateFilterMode>("week");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activityDrawerOpen, setActivityDrawerOpen] = useState(false);
+  const [selectedAgentId, setSelectedAgentId] = useState<Id<"agents"> | null>(null);
+  const [selectedTask, setSelectedTask] = useState<KanbanTask | null>(null);
+
+  const agents = useQuery(api.agents.list);
+  const dashboardStats = useQuery(api.dashboard.getStats);
+
+  const agentsList = useMemo(() => {
+    if (!Array.isArray(agents) || agents.length === 0) return [];
+    return agents as { _id: Id<"agents">; name: string; role: string; status: string; avatar: string; lastSeen?: number }[];
+  }, [agents]);
+
+  const activeCount = useMemo(
+    () => agentsList.filter((a) => ["online", "busy"].includes((a.status ?? "").toLowerCase())).length,
+    [agentsList]
+  );
+
+  const selectedAgent = useMemo(() => {
+    if (!selectedAgentId) return null;
+    return agentsList.find((a) => a._id === selectedAgentId) ?? null;
+  }, [selectedAgentId, agentsList]);
+
+  const handleAgentClick = (agentId: Id<"agents">) => {
+    if (selectedAgentId === agentId) {
+      setSelectedAgentId(null);
+    } else {
+      setSelectedAgentId(agentId);
+    }
+  };
+
+  const handleTaskClick = (task: KanbanTask) => {
+    setSelectedTask(task);
+  };
+
+  const taskCounts = dashboardStats?.taskCounts ?? { backlog: 0, todo: 0, inProgress: 0, review: 0, done: 0 };
+  const inProgressCount = (taskCounts.inProgress ?? 0) + (taskCounts.review ?? 0);
+  const doneCount = taskCounts.done ?? 0;
+  const totalTaskCount =
+    (taskCounts.backlog ?? 0) + (taskCounts.todo ?? 0) + (taskCounts.inProgress ?? 0) + (taskCounts.review ?? 0) + doneCount;
+
+  return (
+    <div className="flex h-screen flex-col bg-background">
+      <NotificationTopBarWrapper
+        agentsActive={activeCount}
+        tasksInQueue={taskCounts.todo ?? 0}
+        inProgress={inProgressCount}
+        doneToday={doneCount}
+        totalTasks={totalTaskCount}
+        onSettingsClick={() => setSettingsOpen(true)}
+        onBellClick={() => setActivityDrawerOpen(true)}
+      />
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <ActivityDrawer open={activityDrawerOpen} onClose={() => setActivityDrawerOpen(false)} />
+      <TaskDetailModal open={selectedTask !== null} task={selectedTask} onClose={() => setSelectedTask(null)} />
+
+      <div className="flex flex-1 min-h-0 flex-col overflow-hidden pb-14 sm:pb-0">
+        <main className="flex-1 min-w-0 flex flex-col overflow-hidden">
+          <MissionQueue
+            date={date}
+            dateMode={dateMode}
+            onDateModeChange={setDateMode}
+            onDateChange={setDate}
+            onTaskClick={handleTaskClick}
+            onAssigneeClick={(id) => handleAgentClick(id as Id<"agents">)}
+          />
+        </main>
+        <AgentBottomBar selectedAgentId={selectedAgentId} onAgentClick={handleAgentClick} />
+      </div>
+
+      {selectedAgent && (
+        <AgentProfileModal
+          open={selectedAgentId !== null}
+          agentId={selectedAgent._id}
+          name={selectedAgent.name}
+          role={selectedAgent.role}
+          status={selectedAgent.status}
+          avatar={selectedAgent.avatar}
+          onClose={() => setSelectedAgentId(null)}
+        />
+      )}
+    </div>
+  );
+}
